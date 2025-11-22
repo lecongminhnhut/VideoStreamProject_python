@@ -4,6 +4,9 @@ import sys, traceback, threading, socket
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
 
+import time
+import json
+
 class ServerWorker:
 	SETUP = 'SETUP'
 	PLAY = 'PLAY'
@@ -23,7 +26,9 @@ class ServerWorker:
 	
 	def __init__(self, clientInfo):
 		self.clientInfo = clientInfo
-		
+		self.network_monitor = ServerNetworkMonitor()
+
+
 	def run(self):
 		threading.Thread(target=self.recvRtspRequest).start()
 	
@@ -56,7 +61,8 @@ class ServerWorker:
 				print("processing SETUP\n")
 				
 				try:
-					self.clientInfo['videoStream'] = VideoStream(filename)
+					#self.clientInfo['videoStream'] = VideoStream(filename)
+					self.setup_hd_streaming(filename)
 					self.state = self.READY
 				except IOError:
 					self.replyRtsp(self.FILE_NOT_FOUND_404, seq[1])
@@ -129,20 +135,20 @@ class ServerWorker:
 					#traceback.print_exc(file=sys.stdout)
 					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
+	def makeRtp(self, payload, frameNbr, marker = 0):
 		"""RTP-packetize the video data."""
 		version = 2
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		marker_bit = marker
 		pt = 26 # MJPEG type
 		seqnum = frameNbr
 		ssrc = 0 
 		
 		rtpPacket = RtpPacket()
 		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
+		rtpPacket.encode(version, padding, extension, cc, seqnum, marker_bit, pt, ssrc, payload)
 		
 		return rtpPacket.getPacket()
 		
@@ -159,3 +165,98 @@ class ServerWorker:
 			print("404 NOT FOUND")
 		elif code == self.CON_ERR_500:
 			print("500 CONNECTION ERROR")
+
+#phan manh 
+def fragment_hd_frame(self, frame_data, frame_number):
+    """Phân mảnh frame HD thành các RTP packet nhỏ hơn MTU"""
+    MTU = 1400  # Maximum Transmission Unit
+    fragments = []
+    
+    # Kiểm tra nếu frame cần phân mảnh
+    if len(frame_data) <= MTU - 12:  # Trừ header RTP
+        # Frame nhỏ, không cần phân mảnh
+        fragments.append((frame_data, 1))  # (data, marker_bit)
+    else:
+        # Phân mảnh frame lớn
+        frame_size = len(frame_data)
+        offset = 0
+        fragment_count = 0
+        
+        while offset < frame_size:
+            # Tính kích thước fragment (trừ header RTP)
+            chunk_size = min(MTU - 12, frame_size - offset)
+            fragment_data = frame_data[offset:offset + chunk_size]
+            offset += chunk_size
+            
+            # Marker bit = 1 cho fragment cuối cùng
+            marker_bit = 1 if offset >= frame_size else 0
+            fragments.append((fragment_data, marker_bit))
+            fragment_count += 1
+            
+        print(f"Frame {frame_number} fragmented into {fragment_count} packets")
+    
+    return fragments
+
+#tinh do tre
+def calculate_adaptive_delay(self, frame_size, network_conditions=None):
+    """Tính delay tối ưu dựa trên kích thước frame và điều kiện mạng"""
+    BASE_DELAY = 0.04  # 40ms base delay cho video thường
+    
+    # Điều chỉnh delay dựa trên kích thước frame
+    if frame_size > 100000:  # Frame HD lớn
+        adaptive_delay = BASE_DELAY * 1.5  # Tăng delay cho frame lớn
+    elif frame_size > 50000:  # Frame HD trung bình
+        adaptive_delay = BASE_DELAY * 1.2
+    else:  # Frame nhỏ
+        adaptive_delay = BASE_DELAY
+    
+    # Điều chỉnh dựa trên điều kiện mạng (nếu có thông tin)
+    if network_conditions and network_conditions.get('congestion', False):
+        adaptive_delay *= 2  # Tăng delay gấp đôi khi mạng nghẽn
+    
+    return max(0.02, min(adaptive_delay, 0.1))  # Giới hạn trong khoảng 20-100ms
+
+##
+def send_rtp_packet(self, rtp_packet, address, port, retry_count=2):
+    """Gửi RTP packet với cơ chế retry và logging"""
+    max_retries = retry_count
+    retries = 0
+    
+    while retries <= max_retries:
+        try:
+            # Gửi packet
+            self.clientInfo['rtpSocket'].sendto(rtp_packet, (address, port))
+            
+            # Log packet đã gửi
+            packet_size = len(rtp_packet)
+            self.log_packet_sent(packet_size, address, port, "HD_FRAME")
+            
+            return True  # Gửi thành công
+            
+        except socket.error as e:
+            retries += 1
+            print(f"Packet send failed, retry {retries}/{max_retries}: {e}")
+            
+            if retries > max_retries:
+                print("Max retries exceeded, packet lost")
+                return False
+    
+    return False
+
+########
+def setup_hd_streaming(self, filename):
+    """Thiết lập streaming cho video HD"""
+    # Mở file video. Nếu file không tồn tại, lệnh này sẽ tự ném lỗi IOError
+    # và hàm processRtspRequest ở trên sẽ bắt lấy nó.
+    self.clientInfo['videoStream'] = VideoStream(filename)
+    
+    # Kiểm tra nếu là video HD (dựa trên kích thước frame đầu tiên)
+    # LƯU Ý: Lệnh nextFrame() sẽ đọc và "tiêu thụ" luôn frame đầu tiên.
+    test_frame = self.clientInfo['videoStream'].nextFrame()
+    
+    if test_frame and len(test_frame) > 50000:  # Frame > 50KB coi như HD
+        print("HD video detected - enabling enhanced streaming")
+        self.clientInfo['is_hd'] = True
+    else:
+        self.clientInfo['is_hd'] = False
+        
